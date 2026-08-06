@@ -1,0 +1,30 @@
+name: submit_p6k
+group: submit
+model_config_file: configs/train/pretrained_unet_6k.yaml
+act_cond_unet_checkpoint: /workspace/open/baseline/outputs/pretrained_unet_6k/pretrained_unet_6k/checkpoints/epoch=1-step=6000.ckpt
+ddim_kwargs:
+  ddim_steps: 25
+  unconditional_guidance_scale: 1.0
+  timestep_spacing: uniform_trailing
+  eta: 0.0
+  verbose: False
+data:
+  target: ldwma.lightning.data_modules.lerobot_so100.SO100DataModule
+  params:
+    root: /workspace/open/data/eval
+    remote: False
+    dataset_paths: auto
+    action_stats_path: /workspace/open/data/train/so100_action_statistics.json
+    normalize_actions: True
+    eval_all_episodes: True
+    batch_size: 4
+    num_workers: 4
+    pin_memory: True
+    target_height: 320
+    target_width: 512
+    pad: True
+    camera_key: observation.images.top
+    traj_len: 16
+    val_fraction: 0.05
+    downsample: 1
+    use_language: False
