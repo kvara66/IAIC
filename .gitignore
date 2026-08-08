@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+upload_v3.py
+check_vae_out/
+cluster_output/
+runs/
+*.log
