@@ -41,7 +41,8 @@ def read_mp4(path):
 
 def to_tensor(video_uint8):
     """정답과 생성본을 같은 공간에 놓는다. 생성본은 이미 320x512 라 패딩이 없다."""
-    return preprocess_video(video_uint8, H, W, True)      # (T,3,H,W) float
+    # preprocess_video 는 (C,T,H,W) 를 준다. 시간축을 앞으로 돌린다.
+    return preprocess_video(video_uint8, H, W, True).permute(1, 0, 2, 3).contiguous()
 
 
 def label(d):
