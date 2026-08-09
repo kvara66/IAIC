@@ -1,0 +1,39 @@
+nohup: ignoring input
+Device: cuda
+[EpisodeIndex] loaded 6298 episodes
+[split] train episodes: 5984, val episodes: 314
+[LeRobotSequenceDataset] 5979 episodes with ≥16 frames
+[LeRobotSequenceDataset] 314 episodes with ≥16 frames
+Cannot initialize model with low cpu memory usage because `accelerate` was not found in the environment. Defaulting to `low_cpu_mem_usage=False`. It is strongly recommended to install `accelerate` for faster and less memory-intense model loading. You can do so with: 
+```
+pip install accelerate
+```
+.
+/usr/local/lib/python3.11/dist-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+/workspace/v3/train.py:246: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler() if args.amp and device.type == "cuda" else None
+/workspace/v3/train.py:88: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=amp):
+/workspace/v3/train.py:110: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=amp):
+[ep0 step50] total=0.2145  dino=0.0529  r3d=0.0144  action=0.4857  lr=5.05e-05  804.6s
+[ep0 step100] total=0.1389  dino=0.0611  r3d=0.0086  action=0.2950  lr=1.00e-04  800.1s
+[ep0 step150] total=0.1169  dino=0.0619  r3d=0.0093  action=0.2387  lr=1.00e-04  799.8s
+[ep0 step200] total=0.0964  dino=0.0538  r3d=0.0050  action=0.1969  lr=1.00e-04  799.7s
+[ep0 step250] total=0.1220  dino=0.0429  r3d=0.0084  action=0.2667  lr=9.99e-05  799.8s
+[ep0 step300] total=0.1257  dino=0.0543  r3d=0.0054  action=0.2694  lr=9.99e-05  799.9s
+[ep0 step350] total=0.0914  dino=0.0485  r3d=0.0076  action=0.1865  lr=9.98e-05  799.9s
+[ep0 step400] total=0.1121  dino=0.0693  r3d=0.0147  action=0.2172  lr=9.98e-05  799.8s
+[ep0 step450] total=0.0757  dino=0.0397  r3d=0.0113  action=0.1510  lr=9.97e-05  799.9s
+[ep0 step500] total=0.0731  dino=0.0443  r3d=0.0040  action=0.1466  lr=9.96e-05  799.6s
+/workspace/v3/train.py:157: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=amp):
+  [val] step=500  val_loss=0.1142
+  → best saved (loss=0.1142)
+Epoch 0 done.
+[ep1 step550] total=0.1128  dino=0.0475  r3d=0.0063  action=0.2415  lr=9.95e-05  801.6s
+[ep1 step600] total=0.1083  dino=0.0445  r3d=0.0045  action=0.2339  lr=9.94e-05  799.4s
+[ep1 step650] total=0.1050  dino=0.0505  r3d=0.0061  action=0.2201  lr=9.92e-05  799.8s
+[ep1 step700] total=0.0988  dino=0.0455  r3d=0.0052  action=0.2090  lr=9.91e-05  799.7s

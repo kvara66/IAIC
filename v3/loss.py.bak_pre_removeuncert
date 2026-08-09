@@ -1,0 +1,226 @@
+﻿"""
+Loss functions for image editing regression.
+
+Total loss = 0.3 * dino_loss + 0.3 * r3d_loss + 0.4 * action_loss
+- dino_loss : 1 - cosine_similarity(DINO features)
+- r3d_loss  : 1 - cosine_similarity(R3D-18 features)  [Stage 2, optional]
+- action_loss: uncertainty-weighted average of 6 per-dim MAE in normalized space (log_vars, learned).
+  채점기와 동일하게 6개 관절 평균 하나로 집계함(합산 아님).
+
+Action extractor: independently trained ActionExtractorIndep
+(action_extractor_indep.py), weights from runs/extractor_v2/best.pt
+(50-epoch run, best val_mae=0.201 @ epoch 43).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import timm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.video import MC3_18_Weights, mc3_18
+
+from action_extractor_indep import ActionExtractorIndep
+
+SUBMISSION_KIT = Path(__file__).parent.parent / "submission_kit"
+ACTION_CKPT    = Path(__file__).parent / "runs" / "extractor_v2" / "best.pt"
+
+ACTIVE_DIMS = [0, 1, 2, 3, 4, 5]  # 전체 6개 dim
+# 관절 순서: [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
+
+
+# ── DINO ───────────────────────────────────────────────────────────────────────
+
+class DINOLoss(nn.Module):
+    """
+    1 - cosine_similarity of CLIP ViT-B/16 (OpenAI) image features.
+
+    채점기는 vit_small_patch14_dinov2(self-supervised)를 씀 — 동일 모델 사용 금지 규정으로
+    CLIP(contrastive, 다른 학습 패러다임/데이터)로 대체. patch32보다 patch16이 토큰 해상도가
+    높아(7x7->14x14) DINO의 patch14 세밀도에 더 가까움. 클래스명은 하위 호환 위해 유지.
+    """
+    MODEL_NAME = "vit_base_patch16_clip_224.openai"
+    IMG_SIZE = 224  # CLIP ViT-B/16 native resolution
+
+    def __init__(self, device: torch.device):
+        super().__init__()
+        self.model = timm.create_model(self.MODEL_NAME, pretrained=True, num_classes=0)
+        self.model.to(device).eval().requires_grad_(False)
+        # OpenAI CLIP normalization (ImageNet 통계 아님)
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+
+    def _extract(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W) in [-1, 1]
+        x = (x.clamp(-1, 1) + 1) / 2
+        x = F.interpolate(x, size=(self.IMG_SIZE, self.IMG_SIZE), mode="bilinear", align_corners=False)
+        x = (x - self.mean) / self.std
+        out = self.model(x)
+        if isinstance(out, dict):
+            out = out.get("x_norm_clstoken", next(iter(out.values())))
+        return out
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        f_pred = self._extract(pred)
+        with torch.no_grad():
+            f_target = self._extract(target)
+        return 1 - F.cosine_similarity(f_pred, f_target, dim=-1).mean()
+
+
+# ── R3D-18 ─────────────────────────────────────────────────────────────────────
+
+class R3DLoss(nn.Module):
+    """
+    1 - cosine_similarity of MC3-18 video features (Stage 2 only).
+
+    채점기는 r3d_18(순수 3D conv)를 씀 — 동일 모델 사용 금지 규정으로 MC3-18(초반만 3D,
+    나머지 2D conv)로 대체. Kinetics-400 전처리(mean/std/112x112)는 r3d_18과 동일해서
+    변경 없음. 클래스명은 하위 호환 위해 유지.
+    """
+    KINETICS_MEAN = torch.tensor([0.43216, 0.394666, 0.37645]).view(1, 3, 1, 1, 1)
+    KINETICS_STD  = torch.tensor([0.22803, 0.22145, 0.216989]).view(1, 3, 1, 1, 1)
+
+    def __init__(self, device: torch.device):
+        super().__init__()
+        model = mc3_18(weights=MC3_18_Weights.DEFAULT)
+        model.fc = nn.Identity()
+        self.model = model.to(device).eval().requires_grad_(False)
+        self.register_buffer("mean", self.KINETICS_MEAN.to(device))
+        self.register_buffer("std", self.KINETICS_STD.to(device))
+
+    def _extract(self, video: torch.Tensor) -> torch.Tensor:
+        # video: (B, T, 3, H, W) in [-1, 1]
+        x = (video.clamp(-1, 1) + 1) / 2
+        x = x.permute(0, 2, 1, 3, 4)  # (B, 3, T, H, W)
+        x = F.interpolate(x, size=(x.shape[2], 112, 112), mode="trilinear", align_corners=False)
+        x = (x - self.mean) / self.std
+        return self.model(x)
+
+    def forward(self, pred_video: torch.Tensor, target_video: torch.Tensor) -> torch.Tensor:
+        f_pred = self._extract(pred_video)
+        with torch.no_grad():
+            f_target = self._extract(target_video)
+        return 1 - F.cosine_similarity(f_pred, f_target, dim=-1).mean()
+
+
+# ── Action MAE ─────────────────────────────────────────────────────────────────
+
+class ActionMAELoss(nn.Module):
+    """
+    Per-dim MAE between action extractor output and GT normalized actions,
+    combined via learned uncertainty weighting (Kendall et al. 2018), 채점기와
+    동일하게 6개 관절 평균 하나로 집계:
+        total = mean_i [ exp(-log_var_i) * mae_i + log_var_i ]
+    log_var_i는 학습되는 파라미터(초기값 0 → 초기 가중치 1, 균등 시작).
+    exp(-log_var_i)가 유효 가중치 역할 — 그냥 자유 파라미터로 두면 가중치를
+    0으로 낮춰서 해당 항을 무시하는 쪽으로 치팅할 수 있는데, 뒤의 "+log_var_i"
+    항이 그 회피에 페널티를 줘서 각 관절의 실제 난이도에 맞게 자동 수렴함.
+
+    Returns (total_loss, dict of per-dim losses(raw MAE, 가중치 반영 전)).
+    """
+
+    def __init__(self, ckpt_path: str | None = None, device: torch.device = torch.device("cpu")):
+        super().__init__()
+        if ckpt_path is None:
+            ckpt_path = str(ACTION_CKPT)
+
+        self.extractor = ActionExtractorIndep()
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        state_dict = ckpt["model"] if "model" in ckpt else ckpt
+        self.extractor.load_state_dict(state_dict)
+        self.extractor.to(device).eval().requires_grad_(False)
+        # forward()가 LSTM 호출을 자체적으로 cudnn.flags(enabled=False)로 감싸서
+        # train/eval 모드가 cuDNN RNN backward에 영향 없음 -> eval() 고정 가능
+        # (BatchNorm3d/Dropout을 위해 eval 고정이 맞음, 공식 extractor의 GroupNorm+GRU와 다름)
+
+        # 관절별 학습되는 loss weight (log-space). optimizer의 trainable에
+        # 반드시 포함시켜야 실제로 학습됨 (train.py에서 action_fn.log_vars 추가할 것)
+        self.log_vars = nn.Parameter(torch.zeros(len(ACTIVE_DIMS), device=device))
+
+    def forward(
+        self,
+        pred_video: torch.Tensor,
+        gt_actions_normalized: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        pred_video: (B, T, 3, H, W) in [-1, 1]
+        gt_actions_normalized: (B, T, 6) normalized observation.state
+
+        Returns (total_loss, per_dim_losses)
+        """
+        # extractor expects (B, C, T, H, W) in [-1, 1]
+        x = pred_video.permute(0, 2, 1, 3, 4)
+        pred_actions = self.extractor(x)  # (B, T, 6)
+
+        per_dim = {}
+        total = torch.tensor(0.0, device=pred_video.device)
+        for idx, i in enumerate(ACTIVE_DIMS):
+            d = F.l1_loss(pred_actions[:, :, i], gt_actions_normalized[:, :, i])
+            per_dim[f"action_mae_dim{i}"] = d  # 로깅용 raw MAE, 가중치 미적용
+            log_var = self.log_vars[idx]
+            total = total + torch.exp(-log_var) * d + log_var
+
+        # 채점기(feature_csv_utils.py)는 torch.mean(..., dim=(1,2))로 T축+6개 관절축을
+        # 한꺼번에 평균냄 — 6개를 더하기만 하면 6배 부풀려지므로 평균으로 맞춤
+        total = total / len(ACTIVE_DIMS)
+
+        return total, per_dim
+
+
+# ── Combined Loss ──────────────────────────────────────────────────────────────
+
+class TotalLoss(nn.Module):
+    """
+    Stage 1: 0.3 * DINO + 0.4 * Action  (R3D 제외)
+    Stage 2: 0.3 * DINO + 0.3 * R3D + 0.4 * Action
+    """
+    W_DINO   = 0.3
+    W_R3D    = 0.3
+    W_ACTION = 0.4
+
+    def __init__(self, device: torch.device, action_ckpt: str | None = None, use_r3d: bool = False):
+        super().__init__()
+        self.dino = DINOLoss(device)
+        self.action = ActionMAELoss(action_ckpt, device)
+        self.use_r3d = use_r3d
+        if use_r3d:
+            self.r3d = R3DLoss(device)
+
+    def forward(
+        self,
+        pred_frame: torch.Tensor,
+        gt_frame: torch.Tensor,
+        gt_actions_norm: torch.Tensor,
+        pred_video: torch.Tensor | None = None,
+        gt_video: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        pred_frame : (B, 3, H, W)   — 단일 프레임 예측
+        gt_frame   : (B, 3, H, W)   — GT 다음 프레임
+        gt_actions_norm: (B, T, 6)  — normalized observation.state
+        pred_video : (B, T, 3, H, W) — Stage 2용 (optional)
+        gt_video   : (B, T, 3, H, W) — Stage 2용 (optional)
+        """
+        logs = {}
+
+        dino = self.dino(pred_frame, gt_frame)
+        logs["dino_loss"] = dino
+
+        # action loss: 단일 프레임을 (B,1,3,H,W)로 확장해서 넘김
+        pred_vid_single = pred_frame.unsqueeze(1)
+        action_total, action_per_dim = self.action(pred_vid_single, gt_actions_norm[:, :1])
+        logs.update(action_per_dim)
+        logs["action_loss"] = action_total
+
+        loss = self.W_DINO * dino + self.W_ACTION * action_total
+
+        if self.use_r3d and pred_video is not None and gt_video is not None:
+            r3d = self.r3d(pred_video, gt_video)
+            logs["r3d_loss"] = r3d
+            loss = loss + self.W_R3D * r3d
+
+        logs["total_loss"] = loss
+        return loss, logs

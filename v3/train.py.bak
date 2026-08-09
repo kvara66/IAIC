@@ -1,0 +1,284 @@
+﻿"""
+Stage 2 training: 16-frame teacher forcing with per-step gradient accumulation.
+
+Loss per step = 0.3 * DINO + 0.4 * Action  (immediate backward after each step)
+R3D: computed on detached pred_video for logging only (no grad to UNet)
+
+This avoids storing 15× DINO/VAE computation graphs simultaneously (OOM fix).
+"""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+from dataset import EpisodeIndex, LeRobotSequenceDataset
+from loss import DINOLoss, R3DLoss, ActionMAELoss
+from model import ImageEditingModel
+
+SEQ_LEN = 16
+W_DINO   = 0.3
+W_R3D    = 0.3
+W_ACTION = 0.4
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--train-root",        default="../data/train")
+    p.add_argument("--action-stats",      default="../data/train/so100_action_statistics.json")
+    p.add_argument("--action-ckpt",       default="../action/best_slim.pt")
+    p.add_argument("--index-cache",       default="episode_index.pkl")
+    p.add_argument("--output-dir",        default="runs/v1")
+    p.add_argument("--samples-per-epoch", type=int, default=100_000)
+    p.add_argument("--batch-size",        type=int, default=4)
+    p.add_argument("--num-workers",       type=int, default=4)
+    p.add_argument("--lr",                type=float, default=1e-4)
+    p.add_argument("--weight-decay",      type=float, default=1e-4)
+    p.add_argument("--max-epochs",        type=int, default=30)
+    p.add_argument("--grad-clip",         type=float, default=1.0)
+    p.add_argument("--log-every",         type=int, default=50)
+    p.add_argument("--val-every",         type=int, default=500)
+    p.add_argument("--save-every",        type=int, default=2000)
+    p.add_argument("--amp",               action="store_true", default=True)
+    p.add_argument("--resume",            default=None)
+    return p.parse_args()
+
+
+def train_step(
+    model: ImageEditingModel,
+    frames: torch.Tensor,   # (B, 16, 3, H, W)
+    states: torch.Tensor,   # (B, 16, 6)
+    dino_fn: DINOLoss,
+    r3d_fn: R3DLoss,
+    action_fn: ActionMAELoss,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    trainable: list,
+    grad_clip: float,
+    amp: bool,
+) -> dict:
+    """
+    Per-step gradient accumulation:
+    - DINO + Action: backward immediately at each step → frees computation graph
+    - R3D: monitored on detached preds (no gradient to UNet)
+
+    Returns logging dict.
+    """
+    B = frames.shape[0]
+    optimizer.zero_grad(set_to_none=True)
+
+    pred_frames_det = []
+    dino_sum = 0.0
+    action_sum = 0.0
+
+    for t in range(SEQ_LEN - 1):
+        with torch.cuda.amp.autocast(enabled=amp):
+            pred, _ = model(frames[:, t], states[:, t], states[:, t + 1])
+            gt_next = frames[:, t + 1]
+
+            d_loss = dino_fn(pred, gt_next)
+
+            # Action extractor expects (B, C, T, H, W); single frame → T=1
+            a_total, _ = action_fn(
+                pred.unsqueeze(1),          # (B, 1, 3, H, W)
+                states[:, t + 1: t + 2],    # (B, 1, 6)
+            )
+
+            step_loss = (W_DINO * d_loss + W_ACTION * a_total) / (SEQ_LEN - 1)
+
+        if scaler:
+            scaler.scale(step_loss).backward()
+        else:
+            step_loss.backward()
+
+        pred_frames_det.append(pred.detach().clamp(-1, 1))
+        dino_sum   += d_loss.item()
+        action_sum += a_total.item()
+
+    # Grad clip + optimizer step
+    if scaler:
+        scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+    if scaler:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+
+    # R3D: monitoring only on detached preds (no grad needed)
+    pred_video = torch.cat(
+        [frames[:, :1], torch.stack(pred_frames_det, dim=1)], dim=1
+    )  # (B, 16, 3, H, W)
+    with torch.no_grad():
+        r3d_loss_val = r3d_fn(pred_video, frames).item()
+
+    dino_avg   = dino_sum   / (SEQ_LEN - 1)
+    action_avg = action_sum / (SEQ_LEN - 1)
+    total_approx = W_DINO * dino_avg + W_ACTION * action_avg + W_R3D * r3d_loss_val
+
+    return {
+        "dino_loss":   dino_avg,
+        "r3d_loss":    r3d_loss_val,
+        "action_loss": action_avg,
+        "total_loss":  total_approx,
+    }
+
+
+def val_step(
+    model: ImageEditingModel,
+    frames: torch.Tensor,
+    states: torch.Tensor,
+    dino_fn: DINOLoss,
+    r3d_fn: R3DLoss,
+    action_fn: ActionMAELoss,
+    amp: bool,
+) -> float:
+    B = frames.shape[0]
+    dino_sum = 0.0
+    action_sum = 0.0
+
+    with torch.no_grad():
+        pred_frames_det = []
+        for t in range(SEQ_LEN - 1):
+            with torch.cuda.amp.autocast(enabled=amp):
+                pred, _ = model(frames[:, t], states[:, t], states[:, t + 1])
+                d_loss = dino_fn(pred, frames[:, t + 1])
+                a_total, _ = action_fn(pred.unsqueeze(1), states[:, t + 1: t + 2])
+            dino_sum   += d_loss.item()
+            action_sum += a_total.item()
+            pred_frames_det.append(pred.clamp(-1, 1))
+
+        pred_video = torch.cat(
+            [frames[:, :1], torch.stack(pred_frames_det, dim=1)], dim=1
+        )
+        r3d_loss_val = r3d_fn(pred_video, frames).item()
+
+    dino_avg   = dino_sum   / (SEQ_LEN - 1)
+    action_avg = action_sum / (SEQ_LEN - 1)
+    return W_DINO * dino_avg + W_ACTION * action_avg + W_R3D * r3d_loss_val
+
+
+def save_checkpoint(path: Path, model, optimizer, scaler, step, best_loss):
+    torch.save({
+        "step": step,
+        "best_loss": best_loss,
+        "unet": model.unet.state_dict(),
+        "action_mlp": model.action_mlp.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict() if scaler else None,
+    }, path)
+
+
+def load_checkpoint(path, model, optimizer, scaler):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model.unet.load_state_dict(ckpt["unet"])
+    model.action_mlp.load_state_dict(ckpt["action_mlp"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    if scaler and ckpt.get("scaler"):
+        scaler.load_state_dict(ckpt["scaler"])
+    return ckpt["step"], ckpt["best_loss"]
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(out_dir / "tb")
+
+    # ── data ──────────────────────────────────────────────────────────────────
+    cache = Path(args.index_cache)
+    index = EpisodeIndex.load(cache) if cache.exists() else EpisodeIndex(args.train_root)
+    if not cache.exists():
+        index.save(cache)
+
+    train_ds = LeRobotSequenceDataset(index, args.action_stats, args.samples_per_epoch)
+    val_ds   = LeRobotSequenceDataset(index, args.action_stats, samples_per_epoch=500)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers,
+                              pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, num_workers=2,
+                              pin_memory=True)
+
+    # ── model & loss ──────────────────────────────────────────────────────────
+    model = ImageEditingModel(cond_dim=256).to(device)
+
+    trainable = list(model.unet.parameters()) + list(model.action_mlp.parameters())
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler() if args.amp and device.type == "cuda" else None
+
+    dino_fn   = DINOLoss(device)
+    r3d_fn    = R3DLoss(device)
+    action_fn = ActionMAELoss(args.action_ckpt, device)
+
+    step, best_loss = 0, float("inf")
+    if args.resume:
+        step, best_loss = load_checkpoint(Path(args.resume), model, optimizer, scaler)
+        print(f"Resumed from step {step}")
+
+    # ── train loop ────────────────────────────────────────────────────────────
+    for epoch in range(args.max_epochs):
+        model.train()
+        t0 = time.time()
+
+        for batch in train_loader:
+            frames = batch["frames"].to(device)   # (B, 16, 3, H, W)
+            states = batch["states"].to(device)   # (B, 16, 6)
+
+            logs = train_step(
+                model, frames, states,
+                dino_fn, r3d_fn, action_fn,
+                optimizer, scaler, trainable, args.grad_clip, args.amp,
+            )
+
+            step += 1
+
+            if step % args.log_every == 0:
+                elapsed = time.time() - t0
+                print(f"[ep{epoch} step{step}] "
+                      f"total={logs['total_loss']:.4f}  "
+                      f"dino={logs['dino_loss']:.4f}  "
+                      f"r3d={logs['r3d_loss']:.4f}  "
+                      f"action={logs['action_loss']:.4f}  "
+                      f"{elapsed:.1f}s")
+                for k, v in logs.items():
+                    writer.add_scalar(f"train/{k}", v, step)
+                t0 = time.time()
+
+            # ── validation ────────────────────────────────────────────────────
+            if step % args.val_every == 0:
+                model.eval()
+                val_totals = []
+                for vb in val_loader:
+                    vf = vb["frames"].to(device)
+                    vs = vb["states"].to(device)
+                    vl = val_step(model, vf, vs, dino_fn, r3d_fn, action_fn, args.amp)
+                    val_totals.append(vl)
+                val_loss = sum(val_totals) / len(val_totals)
+                writer.add_scalar("val/total_loss", val_loss, step)
+                print(f"  [val] step={step}  val_loss={val_loss:.4f}")
+
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    save_checkpoint(out_dir / "best.ckpt", model, optimizer, scaler, step, best_loss)
+                    print(f"  → best saved (loss={best_loss:.4f})")
+                model.train()
+
+            if step % args.save_every == 0:
+                save_checkpoint(out_dir / f"step{step}.ckpt", model, optimizer, scaler, step, best_loss)
+
+        save_checkpoint(out_dir / f"epoch{epoch}.ckpt", model, optimizer, scaler, step, best_loss)
+        print(f"Epoch {epoch} done.")
+
+    writer.close()
+    print("Training complete.")
+
+
+if __name__ == "__main__":
+    main()
