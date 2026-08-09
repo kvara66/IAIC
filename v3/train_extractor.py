@@ -1,0 +1,209 @@
+﻿"""
+ActionExtractorIndep 학습 스크립트.
+LeRobotSequenceDataset 재사용, episode_index_filtered.pkl 기준(필터링은 그대로 유지).
+
+프레임을 원본 해상도(dataset.py는 리사이즈 안 함)로 불러온 뒤, 채점기
+(submission_kit/feature_csv_utils.py의 preprocess_video)와 동일한 방식으로
+320x512 비율유지+패딩해서 모델에 넣음 — 본 모델 학습(loss.py의 ActionMAELoss)도
+같은 전처리로 이 extractor를 호출하므로, 여기서도 같은 분포로 학습해야 함.
+"""
+
+import argparse
+import os
+import random
+import time
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from dataset import EpisodeIndex, LeRobotSequenceDataset
+from action_extractor_indep import ActionExtractorIndep
+
+SUBMISSION_H = 320
+SUBMISSION_W = 512
+
+
+def _resize_pad(frames: torch.Tensor, target_h: int, target_w: int, pad_value: float = 0.0) -> torch.Tensor:
+    """비율 유지 리사이즈 + 패딩 (loss.py의 _resize_pad와 동일 구현 — 채점기 preprocess_video
+    로직 그대로). frames: (..., 3, H, W), 입력은 [0, 1] 범위."""
+    orig_shape = frames.shape
+    x = frames.reshape(-1, *orig_shape[-3:])
+    _, _, height, width = x.shape
+    scale = min(target_h / height, target_w / width)
+    resized_h = max(1, round(height * scale))
+    resized_w = max(1, round(width * scale))
+    x = F.interpolate(x, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+    pad_top = (target_h - resized_h) // 2
+    pad_bottom = target_h - resized_h - pad_top
+    pad_left = (target_w - resized_w) // 2
+    pad_right = target_w - resized_w - pad_left
+    x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), value=pad_value)
+    return x.reshape(*orig_shape[:-2], target_h, target_w)
+
+
+def _to_submission_size(frames: torch.Tensor) -> torch.Tensor:
+    """(B, 16, 3, H, W) in [-1,1], 원본 해상도 -> 320x512 비율유지+패딩, [-1,1] 유지"""
+    frames01 = (frames.clamp(-1, 1) + 1.0) / 2.0
+    frames01 = _resize_pad(frames01, SUBMISSION_H, SUBMISSION_W)
+    return frames01 * 2.0 - 1.0
+
+
+def split_index_by_episode(index: EpisodeIndex, val_ratio: float = 0.05, seed: int = 42):
+    """에피소드 단위로 train/val 분리. LeRobotSequenceDataset.__getitem__이 인덱스를
+    무시하고 항상 전체 풀에서 랜덤 샘플링하므로, random_split(dataset, ...)으로는
+    실질적인 분리가 안 됨(train/val이 같은 분포에서 뽑혀 val_mae가 held-out 지표가
+    아니게 됨) — 반드시 에피소드 자체를 물리적으로 나눠서 각각 별도 Dataset을 만들어야 함.
+    (train.py의 동명 함수와 동일 로직)"""
+    entries = list(index.entries)
+    random.Random(seed).shuffle(entries)
+    n_val = max(1, int(len(entries) * val_ratio))
+
+    train_index = EpisodeIndex.__new__(EpisodeIndex)
+    train_index.entries = entries[n_val:]
+    val_index = EpisodeIndex.__new__(EpisodeIndex)
+    val_index.entries = entries[:n_val]
+    print(f"[split] train episodes: {len(train_index.entries)}, val episodes: {len(val_index.entries)}")
+    return train_index, val_index
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--index",        default="episode_index_filtered.pkl")
+    p.add_argument("--action-stats", default="../data/train/so100_action_statistics.json")
+    p.add_argument("--output-dir",   default="runs/extractor_v3")
+    p.add_argument("--epochs",       type=int,   default=100)
+    p.add_argument("--batch-size",   type=int,   default=8)
+    p.add_argument("--lr",           type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--num-workers",  type=int,   default=4)
+    p.add_argument("--val-ratio",    type=float, default=0.05)
+    p.add_argument("--samples-per-epoch", type=int, default=20000)
+    p.add_argument("--amp",          action="store_true")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Device] {device}")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 데이터셋 ──────────────────────────────────────────────────────────
+    index = EpisodeIndex.load(args.index)
+    train_index, val_index = split_index_by_episode(index, val_ratio=args.val_ratio, seed=42)
+
+    train_ds = LeRobotSequenceDataset(
+        train_index,
+        action_stats_path=args.action_stats,
+        samples_per_epoch=args.samples_per_epoch,
+    )
+    val_ds = LeRobotSequenceDataset(
+        val_index,
+        action_stats_path=args.action_stats,
+        samples_per_epoch=max(1, int(args.samples_per_epoch * args.val_ratio)),
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True, num_workers=args.num_workers,
+                              pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                              shuffle=False, num_workers=args.num_workers,
+                              pin_memory=True)
+
+    # ── 모델 ─────────────────────────────────────────────────────────────
+    # Blackwell GPU(sm_120)에서 flatten_parameters()가 cuDNN 커널 없어 뻗음
+    with torch.backends.cudnn.flags(enabled=False):
+        model = ActionExtractorIndep().to(device)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[Model] {total/1e6:.1f}M parameters")
+
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    best_val_mae = float("inf")
+
+    # ── 학습 루프 ─────────────────────────────────────────────────────────
+    for epoch in range(1, args.epochs + 1):
+        # Train
+        model.train()
+        train_mae = 0.0
+        t0 = time.time()
+
+        for batch in train_loader:
+            frames = batch["frames"].to(device)   # (B, 16, 3, H, W), 원본 해상도
+            states = batch["states"].to(device)   # (B, 16, 6) normalized
+
+            frames = _to_submission_size(frames)  # 채점기와 동일하게 320x512로 정규화
+
+            # extractor 입력: (B, 3, T, H, W)
+            video = frames.permute(0, 2, 1, 3, 4)
+
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                pred = model(video)               # (B, 16, 6)
+                loss = F.mse_loss(pred, states)
+                mae  = F.l1_loss(pred, states)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_mae += mae.item()
+
+        train_mae /= len(train_loader)
+
+        # Validation
+        model.eval()
+        val_mae = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                frames = batch["frames"].to(device)
+                states = batch["states"].to(device)
+                frames = _to_submission_size(frames)
+                video  = frames.permute(0, 2, 1, 3, 4)
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    pred = model(video)
+                val_mae += F.l1_loss(pred, states).item()
+        val_mae /= len(val_loader)
+
+        scheduler.step()
+        elapsed = time.time() - t0
+        print(f"[Epoch {epoch:3d}/{args.epochs}] "
+              f"train_mae={train_mae:.4f}  val_mae={val_mae:.4f}  "
+              f"lr={scheduler.get_last_lr()[0]:.2e}  {elapsed:.0f}s")
+
+        # Best 체크포인트 저장
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "val_mae": val_mae,
+            }, out_dir / "best.pt")
+            print(f"  → best saved (val_mae={val_mae:.4f})")
+
+        # 주기적 체크포인트
+        if epoch % 10 == 0:
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "val_mae": val_mae,
+            }, out_dir / f"epoch_{epoch:03d}.pt")
+
+    print(f"\n[완료] best val_mae={best_val_mae:.4f}")
+    print(f"[저장] {out_dir / 'best.pt'}")
+
+
+if __name__ == "__main__":
+    main()
