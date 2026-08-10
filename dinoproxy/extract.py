@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,20 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (EVAL_H, EVAL_W, content_fraction, cosine, extract_features,
                     model_input_size, normalize_stats)
+
+
+def limit_threads(n: int) -> None:
+    """torch CPU 스레드를 제한한다.
+
+    ⚠ 실측(2026-08-10): 메모리가 작은 컨테이너에서 기본 48스레드로 두면
+      480x640 한 장 전처리에 5.06초가 걸린다. 1스레드면 0.083초다. 61배 차이다.
+      작은 텐서에 스레드를 많이 붙이면 경합 비용이 계산 비용을 압도한다.
+      스레드 수는 결과값에 영향을 주지 않는다(bilinear interpolate 는 결정적).
+    """
+    import torch
+    torch.set_num_threads(max(1, n))
+    torch.set_num_interop_threads(1) if torch.get_num_interop_threads() != 1 else None
+
 
 # 이름 -> (timm 이름, 대체 후보들)
 MODELS: dict[str, list[str]] = {
@@ -133,7 +148,11 @@ def main() -> int:
     # 배치 크기는 특징값에 영향을 주지 않는다(모델이 eval 모드, 샘플 간 독립).
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--determinism", action="store_true", help="같은 모델을 두 번 돌려 값이 같은지 확인")
+    # 느린 CPU 에서 먼저 소수만 돌려 시간을 재보는 용도. 0 이면 전부.
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=8, help="torch CPU 스레드. 2단계 리사이즈가 CPU 에서 돈다")
     args = ap.parse_args()
+    limit_threads(args.threads)
 
     pairs = Path(args.pairs)
     device = torch.device(args.device)
@@ -144,6 +163,9 @@ def main() -> int:
     pred, pred_ids = load_side(pairs / "pred")
     if gt_ids != pred_ids:
         raise SystemExit("[실패] gt 와 pred 의 pair_id 가 다르다. 짝이 어긋났다.")
+    if args.limit:
+        gt, pred, gt_ids = gt[:args.limit], pred[:args.limit], gt_ids[:args.limit]
+        print("⚠ --limit %d : 속도 측정용 부분 실행. 최종 결과로 쓰지 말 것." % args.limit)
     print("쌍 %d개, 장치 %s" % (len(gt_ids), device))
 
     strategy = {}
@@ -158,7 +180,9 @@ def main() -> int:
     for name in [m.strip() for m in args.models.split(",") if m.strip()]:
         print("")
         print("=== %s ===" % name)
+        _t0 = time.time()
         sim, fg, fp, info = run_model(name, gt, pred, device, args.batch)
+        print("   소요          %.1f초  (%.2f초/장)" % (time.time()-_t0, (time.time()-_t0)/max(1,2*len(gt_ids))))
 
         # --- 검증 1: identity 쌍은 거리가 0 이어야 한다 ---
         if ident_idx:
