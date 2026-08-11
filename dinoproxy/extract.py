@@ -55,15 +55,21 @@ MODELS: dict[str, list[str]] = {
     "siglip_b16": ["vit_base_patch16_siglip_224",
                    "vit_base_patch16_siglip_224.webli"],
     "mae_b16":    ["vit_base_patch16_224.mae"],
+    # EVA-02. timm 에 "518" 이름은 없고 최대가 448 이라, 448 을 img_size 로 올려 쓴다
+    "eva02_b14":  ["eva02_base_patch14_448.mim_in22k_ft_in22k_in1k",
+                   "eva02_base_patch14_448.mim_in22k_ft_in1k"],
+    "eva02_l14":  ["eva02_large_patch14_448.mim_m38m_ft_in22k_in1k",
+                   "eva02_large_patch14_448.mim_in22k_ft_in22k_in1k"],
 }
 
 
-def build(name: str, device: torch.device):
+def build(name: str, device: torch.device, force_size: int = 0):
     import timm
     last = None
+    kw = {"img_size": force_size} if force_size > 0 else {}
     for cand in MODELS[name]:
         try:
-            m = timm.create_model(cand, pretrained=True, num_classes=0)
+            m = timm.create_model(cand, pretrained=True, num_classes=0, **kw)
             m.to(device).eval()
             return m, cand
         except Exception as e:
@@ -97,9 +103,9 @@ def load_side(d: Path) -> tuple[torch.Tensor, list[str]]:
 
 
 def run_model(name: str, gt: torch.Tensor, pred: torch.Tensor,
-              device: torch.device, batch: int):
-    model, timm_name = build(name, device)
-    size = model_input_size(model, 0)          # 채점기와 동일하게 0 을 넘긴다
+              device: torch.device, batch: int, force_size: int = 0):
+    model, timm_name = build(name, device, force_size)
+    size = force_size if force_size > 0 else model_input_size(model, 0)
     mean, std = normalize_stats(model)
     frac = content_fraction(EVAL_H, EVAL_W, size)
 
@@ -151,12 +157,17 @@ def main() -> int:
     # 느린 CPU 에서 먼저 소수만 돌려 시간을 재보는 용도. 0 이면 전부.
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--threads", type=int, default=8, help="torch CPU 스레드. 2단계 리사이즈가 CPU 에서 돈다")
+    # 모든 모델을 같은 입력 크기로 강제한다. 0 이면 각 모델 자기 크기(기본).
+    # 채점기가 DINO 용으로 만든 518 결과물을 다른 모델에도 그대로 넣어보는 용도.
+    # ⚠ 224 로 학습된 모델을 518 로 넣으면 위치 임베딩을 보간해야 해서
+    #   학습 때 안 겪은 조건이 된다. 결과 해석에 감안할 것.
+    ap.add_argument("--force-size", type=int, default=0)
     args = ap.parse_args()
     limit_threads(args.threads)
 
     pairs = Path(args.pairs)
     device = torch.device(args.device)
-    outdir = pairs / "feats"
+    outdir = pairs / ("feats%s" % ("_%d" % args.force_size if args.force_size else ""))
     outdir.mkdir(exist_ok=True)
 
     gt, gt_ids = load_side(pairs / "gt")
@@ -181,7 +192,7 @@ def main() -> int:
         print("")
         print("=== %s ===" % name)
         _t0 = time.time()
-        sim, fg, fp, info = run_model(name, gt, pred, device, args.batch)
+        sim, fg, fp, info = run_model(name, gt, pred, device, args.batch, args.force_size)
         print("   소요          %.1f초  (%.2f초/장)" % (time.time()-_t0, (time.time()-_t0)/max(1,2*len(gt_ids))))
 
         # --- 검증 1: identity 쌍은 거리가 0 이어야 한다 ---
@@ -196,7 +207,7 @@ def main() -> int:
 
         # --- 검증 3: 결정성 ---
         if args.determinism:
-            sim2, _, _, _ = run_model(name, gt, pred, device, args.batch)
+            sim2, _, _, _ = run_model(name, gt, pred, device, args.batch, args.force_size)
             d = (sim - sim2).abs().max().item()
             print("   검증 결정성    최대 차이 %.3e   %s" % (d, "통과" if d < 1e-6 else "★실패★"))
             if d >= 1e-6:
