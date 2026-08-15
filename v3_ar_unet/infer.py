@@ -1,24 +1,12 @@
 """
-v3/infer.py
+Non-AR inference: predict each frame independently from frame_0.
 
-eval 데이터 216개 → 16프레임 MP4 생성 (autoregressive chaining)
-
-Flow:
-  frame_0 (PNG) + states[0..15] (NPY, raw → z-score) →
-  frame_1 = model(frame_0, s0, s1)
-  frame_2 = model(frame_1_pred, s1, s2)  ← autoregressive
+frame_0 (PNG) + states[0..15] (NPY) →
+  frame_1 = model(frame_0, state_0, state_1)
+  frame_2 = model(frame_0, state_0, state_2)   ← always from frame_0, no AR
   ...
-  frame_15 = model(frame_14_pred, s14, s15)
+  frame_15 = model(frame_0, state_0, state_15)
   → save [frame_0..frame_15] as sample_XXXXXX.mp4
-
-Usage (서버):
-  cd /workspace/v3
-  python infer.py \\
-    --checkpoint runs/v1/best.ckpt \\
-    --eval-root ../data/eval \\
-    --action-stats ../data/train/so100_action_statistics.json \\
-    --output-dir ../submission_kit/input_videos \\
-    --batch-size 8
 """
 from __future__ import annotations
 
@@ -34,25 +22,22 @@ from PIL import Image
 from model import ImageEditingModel
 
 
-def load_action_stats(path: str) -> tuple[torch.Tensor, torch.Tensor]:
+def load_action_stats(path):
     with open(path) as f:
         d = json.load(f)
     return torch.tensor(d["mean"], dtype=torch.float32), torch.tensor(d["std"], dtype=torch.float32)
 
 
-def preprocess_frame(img_np: np.ndarray) -> torch.Tensor:
-    """(H, W, 3) uint8 → (3, H, W) float32 [-1, 1], 원본 해상도 유지(학습과 동일,
-    채점기가 최종적으로 알아서 비율 유지 리사이즈+패딩하므로 여기서 강제 안 함)"""
+def preprocess_frame(img_np):
     t = torch.from_numpy(img_np).float().permute(2, 0, 1) / 255.0
-    return t * 2.0 - 1.0  # (3, H, W)
+    return t * 2.0 - 1.0
 
 
-def save_mp4(frames: torch.Tensor, path: Path, fps: int = 6) -> None:
-    """frames: (T, 3, H, W) float32 [-1, 1] — 원본 해상도 그대로 저장"""
+def save_mp4(frames, path, fps=6):
     path.parent.mkdir(parents=True, exist_ok=True)
     arr = frames.clamp(-1.0, 1.0)
     arr = ((arr + 1.0) / 2.0 * 255.0).to(torch.uint8)
-    arr = arr.permute(0, 2, 3, 1).cpu().numpy()  # (T, H, W, 3)
+    arr = arr.permute(0, 2, 3, 1).cpu().numpy()
     _, h, w, _ = arr.shape
 
     container = av.open(str(path), mode="w")
@@ -61,7 +46,6 @@ def save_mp4(frames: torch.Tensor, path: Path, fps: int = 6) -> None:
     stream.height = h
     stream.pix_fmt = "yuv420p"
     stream.options = {"crf": "18"}
-
     for frame_np in arr:
         frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
         for packet in stream.encode(frame):
@@ -71,7 +55,7 @@ def save_mp4(frames: torch.Tensor, path: Path, fps: int = 6) -> None:
     container.close()
 
 
-def load_checkpoint(path: Path, model: ImageEditingModel) -> None:
+def load_checkpoint(path, model):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.unet.load_state_dict(ckpt["unet"])
     model.action_mlp.load_state_dict(ckpt["action_mlp"])
@@ -125,27 +109,25 @@ def main():
             for sid in batch_ids:
                 img_np = np.asarray(Image.open(eval_root / "images" / f"{sid}.png").convert("RGB"))
                 frame0_list.append(preprocess_frame(img_np))
-
                 raw = np.load(eval_root / "actions" / f"{sid}.npy").astype(np.float32)
                 st  = torch.from_numpy(raw).to(device)
-                st  = (st - act_mean) / act_std  # (16, 6)
+                st  = (st - act_mean) / act_std
                 states_list.append(st)
 
-            curr_frames = torch.stack(frame0_list).to(device)  # (B, 3, H, W)
-            states      = torch.stack(states_list)              # (B, 16, 6)
+            frame_0 = torch.stack(frame0_list).to(device)  # (B, 3, H, W)
+            states  = torch.stack(states_list)              # (B, 16, 6)
+            state_0 = states[:, 0]                          # (B, 6) — initial state
 
-            all_frames = [curr_frames.cpu()]  # store on CPU to save VRAM
+            all_frames = [frame_0.cpu()]
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                for t in range(15):
-                    pred, _ = model(curr_frames, states[:, t], states[:, t + 1])
+                for t in range(1, 16):
+                    # always predict from frame_0 — no AR chaining
+                    pred, _ = model(frame_0, state_0, states[:, t])
                     pred = pred.clamp(-1.0, 1.0)
                     all_frames.append(pred.cpu())
-                    curr_frames = pred
 
-            # (B, 16, 3, H, W)
-            video_batch = torch.stack(all_frames, dim=1)
-
+            video_batch = torch.stack(all_frames, dim=1)  # (B, 16, 3, H, W)
             for i, sid in enumerate(batch_ids):
                 save_mp4(video_batch[i], out_dir / f"{sid}.mp4", args.fps)
 
