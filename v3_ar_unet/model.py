@@ -1,12 +1,13 @@
 """
-Latent Residual UNet with Action FiLM Conditioning.
+Non-AR + bigger UNet + State Sequence Transformer conditioning.
 
 Pipeline:
-  frame_i (B,3,H,W) → SDXL VAE encode → latent_i (B,4,40,64)
-  [state_i, state_i1] (B,12) → ActionMLP → cond (B,512)
-  latent_i + cond → UNet → delta (B,4,40,64)
-  output_latent = latent_i + delta
-  output_latent → SDXL VAE decode → frame_i1_pred (B,3,H,W)
+  frame_0 (B,3,H,W) → SDXL VAE encode → latent_0 (B,4,60,80)
+  states[0..t] (B,t+1,6) → StateSequenceEncoder → cond (B,512)
+    - self-attention over the full trajectory up to step t
+    - last token (state_t attended to history) → projection
+  latent_0 + cond → UNet (ch=[256,512,1024]) → delta
+  pred_latent = latent_0 + delta → VAE decode → pred_frame_t
 """
 from __future__ import annotations
 
@@ -16,16 +17,12 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKL
 
 
-# ── VAE ────────────────────────────────────────────────────────────────────────
-
 class VAEWrapper(nn.Module):
-    # stabilityai/sdxl-vae는 fp16(AMP)에서 오버플로우로 NaN 나는 걸로 유명함
-    # (madebyollin/sdxl-vae-fp16-fix는 동일 아키텍처/scale, 수치만 안정화된 버전)
     def __init__(self, pretrained: str = "madebyollin/sdxl-vae-fp16-fix"):
         super().__init__()
         self.vae = AutoencoderKL.from_pretrained(pretrained)
         self.vae.requires_grad_(False)
-        self.scale = 0.13025  # SDXL VAE scaling factor
+        self.scale = 0.13025
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.vae.encode(x).latent_dist.mean * self.scale
@@ -34,32 +31,47 @@ class VAEWrapper(nn.Module):
         return self.vae.decode(z / self.scale).sample
 
 
-# ── Action MLP ─────────────────────────────────────────────────────────────────
+class StateSequenceEncoder(nn.Module):
+    """
+    Encode states[0..t] via small Transformer → conditioning vector.
 
-class ActionMLP(nn.Module):
-    """[state_i (6D), state_i1 (6D)] → cond vector (cond_dim)"""
-    def __init__(self, in_dim: int = 12, cond_dim: int = 256):
+    For step t, receives the full state sequence and slices [0..t].
+    The last token (state_t) attends to the full trajectory history,
+    giving the model knowledge of how the robot moved to reach state_t.
+    """
+    def __init__(self, state_dim: int = 6, d_model: int = 64,
+                 n_heads: int = 4, n_layers: int = 2, cond_dim: int = 512):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, 512),
-            nn.SiLU(),
-            nn.Linear(512, 512),
-            nn.SiLU(),
-            nn.Linear(512, cond_dim),
+        self.embed = nn.Linear(state_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,  # pre-norm for training stability
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.out = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, cond_dim),
             nn.SiLU(),
         )
 
-    def forward(self, state_i: torch.Tensor, state_i1: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([state_i, state_i1], dim=-1)
-        return self.net(x)
+    def forward(self, states: torch.Tensor, t: int) -> torch.Tensor:
+        """
+        states: (B, 16, 6) full state sequence
+        t:      int, current target step (1..15)
+                uses states[:, 0..t] — includes state_0 through state_t
+        """
+        seq = states[:, :t + 1]      # (B, t+1, 6)
+        x = self.embed(seq)           # (B, t+1, d_model)
+        x = self.transformer(x)       # (B, t+1, d_model)
+        last = x[:, -1]               # (B, d_model) — state_t informed by history
+        return self.out(last)          # (B, cond_dim)
 
-
-# ── UNet building blocks ────────────────────────────────────────────────────────
 
 class FiLM(nn.Module):
-    """Feature-wise Linear Modulation: scale/shift per channel from cond."""
     def __init__(self, channels: int, cond_dim: int):
         super().__init__()
         self.proj = nn.Linear(cond_dim, channels * 2)
@@ -109,30 +121,21 @@ class AttentionBlock(nn.Module):
         return x + self.proj(h)
 
 
-# ── Latent Residual UNet ────────────────────────────────────────────────────────
-
 class LatentResidualUNet(nn.Module):
-    """
-    Small UNet in latent space. Predicts delta_latent.
-    Channels: 4 → 128 → 256 → 512 (mid) → 256 → 128 → 4
-    """
     def __init__(self, latent_ch: int = 4, cond_dim: int = 256):
         super().__init__()
-        ch = [128, 256, 512]
+        ch = [256, 512, 1024]  # 2x bigger than baseline
 
-        # encoder
         self.enc_in = nn.Conv2d(latent_ch, ch[0], 3, padding=1)
         self.enc0 = ResBlock(ch[0], ch[0], cond_dim)
         self.down0 = nn.Conv2d(ch[0], ch[1], 3, stride=2, padding=1)
         self.enc1 = ResBlock(ch[1], ch[1], cond_dim)
         self.down1 = nn.Conv2d(ch[1], ch[2], 3, stride=2, padding=1)
 
-        # middle
         self.mid0 = ResBlock(ch[2], ch[2], cond_dim)
         self.attn = AttentionBlock(ch[2])
         self.mid1 = ResBlock(ch[2], ch[2], cond_dim)
 
-        # decoder
         self.up1 = nn.ConvTranspose2d(ch[2], ch[1], 2, stride=2)
         self.dec1 = ResBlock(ch[1] * 2, ch[1], cond_dim)
         self.up0 = nn.ConvTranspose2d(ch[1], ch[0], 2, stride=2)
@@ -165,29 +168,22 @@ class LatentResidualUNet(nn.Module):
         return self.out(x)
 
 
-# ── Full model ─────────────────────────────────────────────────────────────────
-
 class ImageEditingModel(nn.Module):
-    def __init__(self, cond_dim: int = 256):
+    def __init__(self, cond_dim: int = 512):
         super().__init__()
         self.vae = VAEWrapper()
-        self.action_mlp = ActionMLP(in_dim=12, cond_dim=cond_dim)
+        self.state_encoder = StateSequenceEncoder(cond_dim=cond_dim)
         self.unet = LatentResidualUNet(latent_ch=4, cond_dim=cond_dim)
 
     def forward(
         self,
-        frame_i: torch.Tensor,
-        state_i: torch.Tensor,
-        state_i1: torch.Tensor,
+        frame_0: torch.Tensor,   # (B, 3, H, W)
+        states: torch.Tensor,    # (B, 16, 6) full sequence
+        t: int,                  # target step index (1..15)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns (pred_frame, pred_latent).
-        pred_frame: (B, 3, H, W) in [-1, 1]
-        pred_latent: (B, 4, H/8, W/8)
-        """
-        latent_i = self.vae.encode(frame_i)
-        cond = self.action_mlp(state_i, state_i1)
-        delta = self.unet(latent_i, cond)
-        pred_latent = latent_i + delta
+        latent_0 = self.vae.encode(frame_0)
+        cond = self.state_encoder(states, t)
+        delta = self.unet(latent_0, cond)
+        pred_latent = latent_0 + delta
         pred_frame = self.vae.decode(pred_latent)
         return pred_frame, pred_latent
